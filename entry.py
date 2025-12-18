@@ -1,5 +1,12 @@
 from js import Response, Headers, URL
 import json
+import re
+
+# --- In-memory store for uploaded documents (per Worker instance) ---
+# NOTE: This is NOT persistent storage, but is enough to make your app work
+# reliably during a session without depending on Workers AI / Vectorize.
+DOCUMENTS = []  # each item: {"filename": str, "text": str}
+
 
 # --- Helper: Standard JSON Response with CORS ---
 def json_response(data, status=200):
@@ -15,9 +22,44 @@ def json_response(data, status=200):
         headers=headers
     )
 
-# --- Helper: Chunk Text ---
-def split_text(text, chunk_size=800):
-    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+# --- Naive text summarization helpers (no external AI) ---
+def simple_snippet(text: str, max_chars: int = 1500) -> str:
+    """Return the first reasonable snippet of text up to max_chars."""
+    t = text.strip()
+    if len(t) <= max_chars:
+        return t
+    return t[:max_chars] + "\n\n[Truncated: document is longer.]"
+
+
+def keyword_snippet(text: str, query: str, max_chars: int = 1500) -> str:
+    """
+    Very simple keyword-based snippet:
+    - Split into paragraphs.
+    - Keep ones that contain any query word.
+    - Fallback to simple_snippet if nothing matches.
+    """
+    if not text:
+        return ""
+
+    query_words = [w.lower() for w in re.findall(r"\w+", query)]
+    if not query_words:
+        return simple_snippet(text, max_chars)
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    matched = []
+    for p in paragraphs:
+        low = p.lower()
+        if any(w in low for w in query_words):
+            matched.append(p)
+
+    if not matched:
+        return simple_snippet(text, max_chars)
+
+    joined = "\n\n---\n\n".join(matched)
+    if len(joined) <= max_chars:
+        return joined
+    return joined[:max_chars] + "\n\n[Truncated: document is longer.]"
 
 async def on_fetch(request, env):
     try:
@@ -64,41 +106,19 @@ async def handle_upload(request, env):
         
         if not filename or not text:
             return json_response({"error": "Missing filename or text in request body"}, 400)
-        
-        chunks = split_text(text)
-        print(f"Processing {filename}: Split into {len(chunks)} chunks.")
 
-        vectors = []
-        
-        for i in range(0, len(chunks), 5):
-            batch_chunks = chunks[i:i+5]
-            
-            try:
-                embedding_resp = await env.AI.run(
-                    "@cf/baai/bge-base-en-v1.5",
-                    {"text": batch_chunks}
-                )
-                
-                for j, vector_data in enumerate(embedding_resp.data):
-                    chunk_index = i + j
-                    chunk_text = batch_chunks[j]
-                    
-                    vectors.append({
-                        "id": f"{filename}_chunk_{chunk_index}",
-                        "values": list(vector_data),
-                        "metadata": {
-                            "text": chunk_text,
-                            "filename": filename,
-                            "chunk_id": str(chunk_index)
-                        }
-                    })
-            except Exception as e:
-                print(f"Error embedding batch {i}: {e}")
+        # Store raw document in in-memory list
+        DOCUMENTS.append({"filename": filename, "text": text})
+        print(f"Stored document '{filename}' in memory. Total docs: {len(DOCUMENTS)}")
 
-        if len(vectors) > 0:
-            await env.VECTORIZE.upsert(vectors)
-
-        return json_response({"status": "success", "chunks_processed": len(vectors)})
+        # We no longer depend on Workers AI or Vectorize here.
+        return json_response(
+            {
+                "status": "success",
+                "message": f"Document '{filename}' stored in memory for Q&A.",
+                "docs_in_memory": len(DOCUMENTS),
+            }
+        )
 
     except Exception as e:
         print(f"Upload Critical Error: {e}")
@@ -113,67 +133,35 @@ async def handle_chat(request, env):
         
         if not query:
             return json_response({"error": "Query cannot be empty"}, 400)
-        
-        # Get embedding for query
-        query_embedding_resp = await env.AI.run("@cf/baai/bge-base-en-v1.5", {"text": [query]})
-        
-        # Extract vector - handle different response formats
-        query_vector = None
-        if hasattr(query_embedding_resp, 'data') and len(query_embedding_resp.data) > 0:
-            query_vector = list(query_embedding_resp.data[0])
-        elif hasattr(query_embedding_resp, 'shape') and hasattr(query_embedding_resp, 'tolist'):
-            query_vector = query_embedding_resp.tolist()
-        elif isinstance(query_embedding_resp, list):
-            query_vector = list(query_embedding_resp[0]) if len(query_embedding_resp) > 0 else []
-        else:
-            raise Exception(f"Unexpected embedding response format: {type(query_embedding_resp)}")
 
-        matches = await env.VECTORIZE.query(query_vector, topK=5, returnMetadata=True)
-        
-        context_texts = []
+        # --- Pure Python Q&A over in-memory documents (no Workers AI, no Vectorize) ---
+        if not DOCUMENTS:
+            return json_response(
+                {
+                    "answer": "I don't have any documents loaded yet. Please upload a file first.",
+                    "sources": [],
+                }
+            )
+
+        # Build a simple keyword-based snippet across all docs
+        snippets = []
         sources = []
-        for match in matches.matches:
-            if hasattr(match, 'metadata') and match.metadata:
-                context_texts.append(str(match.metadata.text))
-                sources.append(str(match.metadata.filename))
-        
-        # Build prompt with context - Python Workers AI expects 'text' or 'requests' format
-        context_str = '\n\n'.join(context_texts) if context_texts else "No relevant context found."
-        
-        # Format as a single text prompt (llama-3-8b-instruct format)
-        full_prompt = f"""<|system|>
-You are a helpful assistant that answers questions based on the provided context. If the answer cannot be found in the context, say so clearly.
+        for doc in DOCUMENTS:
+            snippet = keyword_snippet(doc["text"], query, max_chars=800)
+            if snippet:
+                snippets.append(f"From {doc['filename']}:\n{snippet}")
+                sources.append(doc["filename"])
 
-Context:
-{context_str}
-<|user|>
-{query}
-<|assistant|>
-"""
-
-        # Use 'text' format as required by Python Workers AI binding
-        llama_resp = await env.AI.run(
-            "@cf/meta/llama-3-8b-instruct",
-            {"text": full_prompt}
-        )
-
-        # Extract response
-        answer = ""
-        if hasattr(llama_resp, 'response'):
-            answer = str(llama_resp.response)
-        elif hasattr(llama_resp, 'text'):
-            answer = str(llama_resp.text)
-        elif isinstance(llama_resp, dict):
-            answer = str(llama_resp.get('response', llama_resp.get('text', str(llama_resp))))
-        elif isinstance(llama_resp, str):
-            answer = llama_resp
+        if not snippets:
+            answer = "I couldn't find anything in your uploaded documents related to that question."
         else:
-            answer = str(llama_resp)
+            combined = "\n\n====================\n\n".join(snippets)
+            max_chars = 1500
+            answer = combined[:max_chars]
+            if len(combined) > max_chars:
+                answer += "\n\n[Truncated output; ask more specific questions for details.]"
 
-        return json_response({
-            "answer": answer,
-            "sources": list(set(sources))
-        })
+        return json_response({"answer": answer, "sources": list(set(sources))})
 
     except Exception as e:
         print(f"Chat Error: {e}")
