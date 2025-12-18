@@ -1,0 +1,17 @@
+name = "empire-rag-backend"
+main = "entry.py"
+compatibility_date = "2024-03-20"
+compatibility_flags = ["python_workers"]
+
+# Exclude unnecessary files from bundling
+[build]
+command = ""
+
+# Bind the AI capabilities
+[ai]
+binding = "AI"
+
+# Bind the Vector Database
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "empire-index"

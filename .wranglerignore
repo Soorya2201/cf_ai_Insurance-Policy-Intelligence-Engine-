@@ -1,0 +1,6 @@
+dashboard/
+node_modules/
+.DS_Store
+*.md
+.git/
+.wrangler/
